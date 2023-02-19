@@ -1758,7 +1758,7 @@ instance.prototype.build_choices = function() {
 		{ label: 'Mauve',		id: '12',	fg: self.rgb(161, 141, 254) }
 	];
 
-	self.TAPE_FUNCITONS = [
+	self.TAPE_FUNCTIONS = [
 		{ label: 'STOP',                id: '0' },
 		{ label: 'PLAY PAUSE',          id: '1' },
 		{ label: 'PLAY',                id: '2' },
