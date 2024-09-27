@@ -1,2 +1,4 @@
 node_modules/
 floattest.js
+/pkg
+/pkg.tgz

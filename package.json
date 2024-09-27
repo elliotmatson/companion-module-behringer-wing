@@ -1,31 +1,19 @@
 {
-	"name": "behringer-wing",
-	"legacy": [
-		"wing"
-	],
-	"version": "1.0.8",
-	"api_version": "1.0.0",
-	"keywords": [
-		"Audio",
-		"Mixer",
-		"Console"
-	],
-	"manufacturer": "Behringer",
-	"product": "WING",
-	"shortname": "wing",
-	"description": "Module to control Behringer WING consoles",
-	"main": "index.js",
-	"scripts": {
-		"test": "echo \"Error: no test specified\" && exit 1"
-	},
-	"author": "John Knight, Jr <istnv@ayesti.com>",
-	"license": "MIT",
-	"homepage": "https://github.com/bitfocus/companion-module-behringer-wing#readme",
-	"bugs": {
-		"url": "https://github.com/bitfocus/companion-module-behringer-wing/issues"
-	},
-	"repository": {
-		"type": "git",
-		"url": "git+https://github.com/bitfocus/companion-module-behringer-wing.git"
-	}
+  "name": "behringer-wing",
+  "version": "2.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bitfocus/companion-module-behringer-wing.git"
+  },
+  "dependencies": {
+    "@companion-module/base": "~1.11"
+  },
+  "devDependencies": {
+    "@companion-module/tools": "^2.1.0"
+  }
 }
