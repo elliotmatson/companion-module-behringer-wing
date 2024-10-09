@@ -1,189 +1,560 @@
 'use strict';
-var instance_skel = require('../../instance_skel');
-var OSC = require('osc');
+import OSC from "osc";
+import {
+  runEntrypoint,
+  InstanceBase,
+  InstanceStatus,
+  Regex,
+} from "@companion-module/base";
+import { UpgradeScripts } from "./upgrades.js";
+import { ICON_SOLO } from "./icons.js";
+
+/*
 var stripDef = require('./defstrip.json');
 var monDef = require('./defmons.json');
 var actDef = require('./defaction.json');
 var busDef = require('./defbus.json');
-
-var debug;
-var log;
+*/
 
 
-function instance(system, id, config) {
-	var self = this;
-	var po = 0;
+class WingInstance extends InstanceBase {
+	constructor(internal) {
+		super(internal);
+	}
 
-	// self.currentSnapshot = {
-	// 	name: '',
-	// 	index: 0
-	// };
+	async init(config) {
+		this.config = config;
 
-	self.myMixer = {
-		ip: '',
-		name: '',
-		model: '',
-		serial: '',
-		fw: ''
+		// this.currentSnapshot = {
+		// 	name: '',
+		// 	index: 0
+		// };
+		
+		this.myMixer = {
+			ip: '',
+			name: '',
+			model: '',
+			serial: '',
+			fw: ''
+		};
+
+		// mixer state
+		this.xStat = {};
+		// level/fader value store
+		this.tempStore = {};
+		// stat id from mixer address
+		this.fbToStat = {};
+
+		this.actionDefs = {};
+		this.toggleFeedbacks = {};
+		this.colorFeedbacks = {};
+		this.variableDefs = [];
+		this.soloList = new Set();
+		this.fLevels = {};
+		this.FADER_STEPS = 1540;
+		this.fLevels[this.FADER_STEPS] = [];
+		this.blinkingFB = {};
+		this.blinkOn = false;
+		this.crossFades = {};
+		this.needStats = true;
+
+		this.PollTimeout = 800;
+		this.PollCount = 7;
+
+	//	this.build_choices();
+
+		// cross-fade steps per second
+		this.fadeResolution = 20;
+
+	//	this.build_strips();
+	//	this.build_monitor();
+	//	this.build_talk();
+	//	this.init_actions();
+		this.init_variables();
+	//	this.init_feedbacks();
+	//	this.init_presets();
+		this.log("debug", Object.keys(this.xStat).length + " status addresses generated");
+		this.init_osc();
+
+	}
+
+	// When module gets deleted
+	async destroy() {
+		this.log("debug", "destroy");
+		if (this.heartbeat) {
+			clearInterval(this.heartbeat);
+			delete this.heartbeat;
+		}
+		if (this.blinker) {
+			clearInterval(this.blinker);
+			delete this.blinker;
+		}
+		if (this.fader) {
+			clearInterval(this.fader);
+			delete this.fader;
+		}
+		if (this.oscPort) {
+			this.oscPort.close();
+		}
+	}
+
+	async configUpdated(config) {
+		this.init(config);
+	}
+
+	// define instance variables
+	init_variables() {
+		let variables = [
+			{
+				name: 'WING IP Address',
+				variableId:  'm_ip',
+			},
+			{
+				name: 'WING Name',
+				variableId:  'm_name'
+			},
+			{
+				name: 'WING Model',
+				variableId:  'm_model'
+			},
+			{
+				name: 'WING Serial Number',
+				variableId:  'm_serial'
+			},
+			{
+				name: 'WING Firmware',
+				variableId:  'm_fw'
+			// },
+			// {
+			// 	name: 'Current Snapshot Name',
+			// 	variableId:  's_name'
+			// },
+			// {
+			// 	name: 'Current Snapshot Index',
+			// 	variableId:  's_index'
+			}
+		];
+		variables.push.apply(variables, this.variableDefs);
+
+		this.setVariableDefinitions(variables);
 	};
 
-	// mixer state
-	self.xStat = {};
-	// level/fader value store
-	self.tempStore = {};
-	// stat id from mixer address
-	self.fbToStat = {};
-
-	self.actionDefs = {};
-	self.toggleFeedbacks = {};
-	self.colorFeedbacks = {};
-	self.variableDefs = [];
-	self.soloList = new Set();
-	self.fLevels = {};
-	self.FADER_STEPS = 1540;
-	self.fLevels[self.FADER_STEPS] = [];
-	self.blinkingFB = {};
-	self.crossFades = {};
-	self.needStats = true;
-
-	self.PollTimeout = 800;
-	self.PollCount = 7;
-
-	self.build_choices();
-
-	// super-constructor
-	instance_skel.apply(this, arguments);
-
-	if (process.env.DEVELOPER) {
-		self.config._configIdx = -1;
-	}
-
-	// each instance needs a separate local port
-	id.split('').forEach(function (c) {
-		po += c.charCodeAt(0);
-	});
-	self.port_offset = po;
-
-	return self;
-}
-
-instance.GetUpgradeScripts = function() {
-	return [
-		function() {
-			// 'old' script that does nothing, but cannot be removed
-			return false
+	/**
+	 * heartbeat to request updates, subscription expires every 10 seconds
+	 */
+	pulse() {
+		this.sendOSC("/*s", []);
+		this.log("debug", "re-subscribe");
+		// any leftover status needed?
+		if (this.myMixer.model == '') {
+			this.sendOSC("/?", []);
 		}
-	]
-}
+		if (this.needStats) {
+			this.pollStats();
+		}
 
-instance.prototype.ICON_SOLO =
-	'iVBORw0KGgoAAAANSUhEUgAAAEgAAAA6CAYAAAATBx+NAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAALEwAACxMBAJqcGAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAUcSURBVHic7ZpLaFxVGIC//96ZTNKkqSnGN+JzUS3oyqi1ogstqKAIuhIVFEUUtOBGhC5UxI2FgigYKLqpFRdV8FFsN1rFbtoGWwyl1lStsa+0NjNJzsy5M7+LuXdyZzKT00zSJpTzwYU573O/+c859w4jeQ0UTytMsNgzWOp4QQ4y6YQijyrl4cWazFIgIHgHeDJJ1wkKKf/dLRy64LNaQuSV8XTaLzEHXpADL8iBF+TAC3LgBTnwghx4QQ68IAdekAMvyIEX5MALcuAFOfCCHHhBDrwgB16QAy/IgRfkwAty4AU58IIceEEOvCAHXpADL8iBF+TAC3LgBTnwghx4QQ68IAcNf8GjfzEmoUpfucgalJUIY2VhpKODYRHa+gduZPhY4XpVjnd08dS8JpfXQJNrXIORgnL5vDqcIyXDC9ZQsAZtuE5Ehofa6dMafrUGLRlG5to2r8FgyslUbYmJgsB1SrBzXLm0nYnNldIkAwIfAd1NivsryhUXYh6zURPUYStINaBXC8GOs8rK8z54wLOpOWxEuVfgEYQ3YYn8mTQJpzgkdaJcC699/yl953Nsa9gRL6eTjWWqBKqsaMjrskXesIY91jBqDfut4T1tmGerJaZKr53i7bh81BqGbJENqtMR3LjE6gTNlBT+clJZvtBiUjeyLR43iqZ4WpVsq7qqdFjDj032KrWG31S5JNXvDEGqLLeGoabti+xWpbOZoBnHvABZWyGoKKB3dhJuP6H0LKya2mB74k+hCp9GJf61hi+iIk+okktXjYq8CqyN5/g7yrvAUFy8qlzkrdmGiopsAG6Lkwfi9gcBUAaiEq83bZjXQAupCEpfE2VJImnXMW26kc4LVfoiw+EWUbHfGG5I6iZRYQ1lY7gxbr/CGsbj/NOq1f2sWQRZw7G43pSOVw8hneQaa7Bx/sHYx+wRlKbDKmE1ku7pRrYlYbhQiHAmLHEHsAk401C8OqzmEy+9W+P84c5ODsftzwI/xfl9xnBts3F0giuh9viyW3o5BSDLOIrWovBmbRIEVUGzPI5la5LkgQLyZWPozxfpZSzbyWuZHJeh3CfC5lTxOlVCoIfp024s3V6lerMAYVi/qScUQ3pTyVN1hVLrT5isqwec46tG1iphWQFZV0C2zraZtosIUbaLHzI5ngN2JUMzQT8wwfTXWHdiSeoEq1TIN+s7V6GQStafzOkTcNnM9uf8LpaNapIeiyVlnI0cWMPGkuFlVTpq863KTx5UK3QzLkKJZEOFW3SSq+O6XcCaOH88l+PPpgN1MZqKlAGNT2bN049wO4DAiEidSGCOL6spSY8XCLbMV5IqVwl8EBX5xxq+iopsjooMAaviKvtEmKR6B1vivDAK+LpkWB8V+Y44IgQ+F6HcbBwRVJTP4mRPVGJ7ybA+yvAtVL8c1Vr/9eQ10EKl+SnW6pqMJHl3+yQ5OdqhNMXWWcYpR4aHUzKXWcPeZnVLhiNamH6HbPEctDIyHGox1oEkquZ0irUiiSSBZyYIBtuVlLW8ovAS8L3AH0CJ6mm2A+XBTCffJHVFmMzkuB94X+EIYIFRgcFsmbukh+O1urAb2Inyc6r96dByt8CHwFHAKvwFbMrkWCvSfP+SvAYqCrlSZc43GGWEKBSAwR4qL7b788RSIq/BIPB8nDTzEgQQhUKUEUCHQfYu1EQXkQHgpvjztKDqq0V7VAJBZUEmt9QwGQAVKIcX5x3Ol4xUH8LaRqt9CNVN86JCYep/T6xGm2u0hEsAAAAASUVORK5CYII=';
+	};
 
+	/**
+	 * blink feedbacks
+	 */
+	blink() {
+		this.blinkOn = !this.blinkOn
+		this.checkFeedbacks(...Object.keys(this.blinkingFB))
+	};
 
-instance.prototype.updateConfig = function(config) {
-	var self = this;
+	/**
+	 * timed fades
+	 */
+	doFades() {
+		let arg = { type: 'f' };
+		let fadeDone = [];
 
-	self.config = config;
-	if (config.analyze) {
-		self.analyzing = true;
-		self.detVars = { startCount: 5, startTimeout: 200, endCount: 12, endTimeout: 4000 }
-		self.passCount = 5;
-		self.PollCount = 5;
-		self.passTimeout = 200;
-		self.PollTimeout = 200;
-		self.varCounter = 0;
-		self.firstPoll();
-		self.log('info', `Sync Started (${self.PollCount}/${self.PollTimeout})`);
-		self.config.analyze = false;
-	} else {
-		self.PollCount = 7;
-		self.PollTimeout = 800;
-		self.init();
-	}
-};
+		for (let f in this.crossFades) {
+			let c = this.crossFades[f];
+			c.atStep++;
+			let atStep = c.atStep;
+			let newVal = c.startVal + c.delta * atStep;
+			let v = (Math.sign(c.delta)>0) ? Math.min(c.finalVal, newVal) : Math.max(c.finalVal, newVal);
 
-instance.prototype.init = function() {
-	var self = this;
+			arg.value = this.faderToDB(v);
 
-	debug = self.debug;
-	log = self.log;
+			this.sendOSC(f, arg);
+			this.log("debug", f + ": " + JSON.stringify(arg));
+			this.setVariableValues({
+				[this.xStat[f].dvID + "_p"]: Math.round(v * 100),
+				[this.xStat[f].dvID + '_d']: this.faderToDB(v,true)
+			})
 
-	// cross-fade steps per second
-	self.fadeResolution = 20;
+			if (atStep > c.steps) {
+				fadeDone.push(f);
+			}
+		}
 
-	self.build_strips();
-	self.build_monitor();
-	self.build_talk();
-	self.init_actions();
-	self.init_variables();
-	self.init_feedbacks();
-//	self.init_presets();
-	debug(Object.keys(self.xStat).length + " status addresses generated");
-	self.init_osc();
-
-};
-
-/**
- * heartbeat to request updates, subscription expires every 10 seconds
- */
-instance.prototype.pulse = function () {
-	var self = this;
-	self.sendOSC("/*s", []);
-	self.debug('re-subscribe');
-	// any leftover status needed?
-	if (self.myMixer.model == '') {
-		self.sendOSC("/?", []);
-	}
-	if (self.needStats) {
-		self.pollStats();
-	}
-
-};
-
-/**
- * blink feedbacks
- */
-instance.prototype.blink = function () {
-	var self = this;
-	for (var f in self.blinkingFB) {
-		self.checkFeedbacks(f);
-	}
-};
-
-/**
- * timed fades
- */
-instance.prototype.doFades = function () {
-	var self = this;
-	var arg = { type: 'f' };
-	var fadeDone = [];
-
-	for (var f in self.crossFades) {
-		var c = self.crossFades[f];
-		c.atStep++;
-		var atStep = c.atStep;
-		var newVal = c.startVal + (c.delta * atStep)
-		var v = (Math.sign(c.delta)>0) ? Math.min(c.finalVal, newVal) : Math.max(c.finalVal, newVal);
-
-		arg.value = self.faderToDB(v);
-
-		self.sendOSC(f, arg);
-		self.debug(f + ": ", arg);
-		self.setVariable(self.xStat[f].dvID + '_p',Math.round(v * 100));
-		self.setVariable(self.xStat[f].dvID + '_d',self.faderToDB(v,true));
-
-		if (atStep > c.steps) {
-			fadeDone.push(f);
+		// delete completed fades
+		for (let f in fadeDone) {
+			this.sendOSC(fadeDone[f], []); // Why?
+			delete this.crossFades[fadeDone[f]];
 		}
 	}
 
-	// delete completed fades
-	for (f in fadeDone) {
-		self.sendOSC(fadeDone[f],[]);
-		delete self.crossFades[fadeDone[f]];
+	pollStats() {
+		let stillNeed = false;
+		let counter = 0;
+		let timeNow = Date.now();
+		let timeOut = timeNow - this.PollTimeout;
+		let varCounter = this.varCounter;
+
+		function ClearVars() {
+			for (var id in this.xStat) {
+				this.xStat[id].polled = 0;
+				this.xStat[id].valid = false;
+			}
+		}
+
+		let id;
+
+		for (id in this.xStat) {
+			if (!this.xStat[id].valid) {
+				stillNeed = true;
+				if (this.xStat[id].polled < timeOut) {
+					this.sendOSC(id);
+					// this.log("debug", "sending " + id);
+					this.xStat[id].polled = timeNow;
+					counter++;
+					if (counter > this.PollCount) {
+						break;
+					}
+				}
+			}
+		}
+
+		if (this.analyzing) {
+			if (varCounter < 200) {
+				this.varCounter = varCounter;
+			} else {
+				stillNeed = false;
+			}
+		}
+
+		if (!stillNeed) {
+			if (this.analyzing) {
+				//pause counting while resetting data
+				this.needStats = false;
+				var d = (timeNow - this.timeStart) / 1000;
+				this.log('info', 'Pass complete (' + varCounter + '@' + (varCounter / d).toFixed(1) + ')');
+				if (this.passTimeout < this.detVars.endTimeout) {
+					this.passTimeout += 200;
+					this.PollTimeout = this.passTimeout;
+					this.varCounter = 0;
+					this.timeStart = Date.now();
+					stillNeed = true;
+				} else if (this.passCount < this.detVars.endCount) {
+					this.passTimeout = this.detVars.startTimeout;
+					this.PollTimeout = this.passTimeout;
+					this.passCount += 1;
+					this.varCounter = 0;
+					this.PollCount = this.passCount;
+					this.timeStart = Date.now();
+					stillNeed = true;
+				} else {
+					this.analyzing = false;
+				}
+				if (this.analyzing) {
+					ClearVars();
+					this.log('info', `Sync Started (${this.PollCount}/${this.PollTimeout})`);
+				}
+			} else {
+				this.updateStatus(InstanceStatus.Ok, "Console status loaded");
+				const c = Object.keys(this.xStat).length;
+				const d = (timeNow - this.timeStart) / 1000;
+				this.log("info", "Sync complete (" + c + "@" + (c / d).toFixed(1) + ")");
+			}
+		}
+		this.needStats = stillNeed;
 	}
+
+	firstPoll() {
+		this.timeStart = Date.now();
+		this.sendOSC('/?',[]);
+		this.pollStats();
+		this.pulse();
+	}
+
+	stepsToFader(i, steps) {
+		let res = i / ( steps - 1 );
+
+		return Math.floor(res * 10000) / 10000;
+	}
+
+	faderToDB(f, asString) {
+	// “f” represents OSC float data. f: [0.0, 1.0]
+	// “d” represents the dB float data. d:[-oo, +10]
+
+		// float Lin2db(float lin) {
+		// 	if (lin <= 0.0) return -144.0;
+		// 	if (lin < 0.062561095) return (lin - 0.1875) * 30. / 0.0625;
+		// 	if (lin < 0.250244379) return (lin - 0.4375) / 0.00625;
+		// 	if (lin < 0.500488759) return (lin - 0.6250) / 0.0125;
+		// 	if (lin < 1.0) return (lin - 0.750) / 0.025;
+		// 	return 10.;
+		let d = 0;
+		let steps = this.FADER_STEPS;
+
+		if (f <= 0.0) {
+			d = -144;
+		} else if (f < 0.062561095) {
+			d = (f - 0.1875) * 30.0 / 0.0625;
+		} else if (f < 0.250244379) {
+			d = (f - 0.4375) / 0.00625;
+		} else if (f < 0.500488759) {
+			d = (f - 0.6250) / 0.0125;
+		} else if (f < 1.0) {
+			d = (f - 0.750) / 0.025;
+		} else {
+			d = 10.0;
+		}
+
+		d = (Math.round(d * (steps - 0.5)) / steps)
+
+		if (asString) {
+			return (f==0 ? "-oo" : (d>=0 ? '+':'') + d.toFixed(1));
+		} else {
+			return d;
+		}
+	}
+
+	dbToFloat(d) {
+		// “d” represents the dB float data. d:[-144, +10]
+		// “f” represents OSC float data. f: [0.0, 1.0]
+		let f = 0;
+
+		if (d <= -90) {
+			f = 0;
+		} else if (d < -60.) {
+			f = (d + 90.) / 480.;
+		} else if (d < -30.) {
+			f = (d + 70.) / 160.;
+		} else if (d < -10.) {
+			f = (d + 50.) / 80.;
+		} else if (d <= 10.) {
+			f = (d + 30.) / 40.;
+		}
+
+		return f;
+
+	}
+
+	init_osc() {
+		if (this.oscPort) {
+			this.oscPort.close();
+		}
+		if (!this.config.host) {
+			this.updateStatus(InstanceStatus.ConnectionFailure, "No host IP");
+		} else {
+			this.oscPort = new OSC.UDPPort ({
+				localAddress: "0.0.0.0",
+				localPort: 0,
+				remoteAddress: this.config.host,
+				remotePort: 2223,
+				metadata: true
+			});
+
+			// listen for incoming messages
+			this.oscPort.on('message', (message, timeTag, info) => {
+				const args = message.args;
+				const node = message.address;
+				const leaf = node.split("/").pop();
+				let v = 0;
+
+				if (!this.needStats) {
+					this.log("debug", "received " + JSON.stringify(message) + " from " + JSON.stringify(info));
+				}
+				if (this.xStat[node] !== undefined) {
+					if (args.length>1) {
+						v = args[1].value;
+					} else {
+						v = args[0].value;
+					}
+					switch (leaf) {
+					case 'on':
+						this.xStat[node].isOn = v == 1;
+						this.checkFeedbacks(this.xStat[node].fbID);
+						break;
+					case 'mute':
+					case 'led':
+					case '$solo':
+						this.xStat[node].isOn = v == 1;
+						if ('led' == leaf) {
+							this.checkFeedbacks("col");
+						}
+						if ('$solo' == leaf) {
+							var gs = true;
+							if (v == 1){
+								this.soloList.add(node);
+							} else {
+								this.soloList.delete(node);
+								gs = this.soloList.size > 0;
+							}
+							this.xStat["/$stat/solo"].isOn = gs;
+						}
+						this.checkFeedbacks(this.xStat[node].fbID);
+						break;
+					case 'fdr':
+					case 'lvl':
+						v = Math.floor(v * 10000) / 10000;
+						this.xStat[node][leaf] = v;
+						this.setVariableValues({
+							[this.xStat[node].dvID + "_p"]: Math.round(v * 100),
+							[this.xStat[node].dvID + '_d']: this.faderToDB(v,true)
+						})
+						this.xStat[node].idx = this.fLevels[this.FADER_STEPS].findIndex((i) => i >= v);
+						break;
+					case 'name':
+						// no name, use behringer default
+						if (v=='') {
+							v = this.xStat[node].defaultName;
+						}
+						if (node.match(/\/main/)) {
+							v = v;
+						}
+						this.xStat[node].name = v;
+						this.setVariableValues({
+							[this.xStat[node].dvID]: v
+						});
+						break;
+					case 'col':
+						this.xStat[node].color = parseInt(args[0].value);
+						this.checkFeedbacks(this.xStat[node].fbID);
+						this.checkFeedbacks("led");
+						break;
+					case '$mono':
+					case '$dim':
+						this.xStat[node].isOn = v == 1;
+						this.checkFeedbacks(this.xStat[node].fbID);
+						break;
+					default:
+						if ( node.match(/\$solo/)
+						|| node.match(/^\/cfg\/talk\//)
+						|| node.match(/^\/\$stat\/solo/) ) {
+							this.xStat[node].isOn = v == 1;
+							this.checkFeedbacks(this.xStat[node].fbID);
+						}
+					}
+					this.xStat[node].valid = true;
+					this.varCounter += 1;
+					if (this.needStats) {
+						this.pollStats();
+					} else {
+						// debug(message);
+					}
+				} else if (leaf == '*') {
+					// /?~~,s~~WING,192.168.1.71,PGM,ngc‐full,NO_SERIAL,1.07.2‐40‐g1b1b292b:develop~~~~
+					let mixer_info = args[0].value.split(',');
+					this.myMixer.ip = mixer_info[1];
+					this.myMixer.name = mixer_info[2];
+					this.myMixer.model = mixer_info[3];
+					this.myMixer.serial = mixer_info[4];
+					this.myMixer.fw = mixer_info[5];
+					if ('WING_EMU' == mixer_info[4]) {
+						this.PollTimeout = 3200;
+						this.PollCount = 7;
+					}
+					this.setVariableValues({
+						"m_ip": this.myMixer.ip,
+						"m_name": this.myMixer.name,
+						"m_model": this.myMixer.model,
+						"m_serial": this.myMixer.serial,
+						"m_fw": this.myMixer.fw
+					});
+				}
+				else {
+					this.log("debug", message.address + ": " +  JSON.stringify(args));
+				}
+			});
+
+			this.oscPort.on('ready', () => {
+				this.updateStatus(InstanceStatus.Connecting, "Loading console status");
+				this.log("info", `Sync Started (${this.PollCount}/${this.PollTimeout})`);
+				this.firstPoll();
+				this.heartbeat = setInterval( () => { this.pulse(); }, 9000);
+				this.blinker = setInterval( () => { this.blink(); }, 1000);
+				this.fader = setInterval( () => { this.doFades(); }, 1000 / this.fadeResolution);
+			});
+
+			this.oscPort.on('close', () => {
+				if (this.heartbeat) {
+					clearInterval(this.heartbeat);
+					delete this.heartbeat;
+				}
+				if (this.blinker) {
+					clearInterval(this.blinker);
+					delete this.blinker;
+				}
+				if (this.fader) {
+					clearInterval(this.fader);
+					delete this.fader;
+				}
+			});
+
+			this.oscPort.on('error', (err) => {
+				this.log('error', "Error: " + err.message);
+				this.updateStatus(InstanceStatus.UnknownError, err.message)
+				if (this.heartbeat) {
+					clearInterval(this.heartbeat);
+					delete this.heartbeat;
+				}
+				if (this.blinker) {
+					clearInterval(this.blinker);
+					delete this.blinker;
+				}
+				if (this.fader) {
+					clearInterval(this.fader);
+					delete this.fader;
+				}
+			});
+
+			this.oscPort.open();
+		}
+	}
+
+	sendOSC(node, arg) {
+		if (this.oscPort) {
+			this.oscPort.send({
+				address: node,
+				args: arg
+			});
+			this.log("debug", 'sending ' + node + (arg? arg:''));
+		}
+	}
+
+
+  // Return config fields for web config
+  getConfigFields() {
+    return [
+      {
+        type: "textinput",
+        id: "host",
+        label: "Target IP",
+        tooltip: "The IP of the WING console",
+        width: 6,
+        regex: Regex.IP,
+      },
+      // ,
+      // {
+      // 	type: 	'checkbox',
+      // 	label: 	'Analyze',
+      // 	id:		'analyze',
+      // 	tooltip: 'Cycle through console sync timing variables\nThis will temporarily disable the module',
+      // 	default: 0
+      // }
+    ];
+  }
 }
 
+runEntrypoint(WingInstance, UpgradeScripts);
+
+/*
 instance.prototype.init_presets = function () {
 	var self = this;
 
@@ -268,7 +639,6 @@ instance.prototype.init_presets = function () {
 	];
 	// self.setPresetDefinitions(presets);
 };
-
 
 instance.prototype.build_strips = function () {
 	var self = this;
@@ -962,16 +1332,13 @@ instance.prototype.build_monitor = function () {
 
 			if (stat.isOn) {
 				if (opt.blink) {		// wants blink
-					if (self.blinkingFB[stat.fbID]) {
-						self.blinkingFB[stat.fbID] = false;
-						// blink off
-						return;
-					} else {
-						self.blinkingFB[stat.fbID] = true;
+					self.blinkingFB[stat.fbID] = true;
+					if(!self.blinkOn) {
+						return
 					}
 				}
 				return { color: opt.fg, bgcolor: opt.bg };
-			} else if (self.blinkingFB[stat.fbID]) {
+			} else {
 				delete self.blinkingFB[stat.fbID];
 			}
 
@@ -1152,372 +1519,6 @@ instance.prototype.build_talk = function () {
 	Object.assign(self.toggleFeedbacks, talkFeedbacks);
 };
 
-instance.prototype.pollStats = function () {
-	var self = this;
-	var stillNeed = false;
-	var counter = 0;
-	var timeNow = Date.now();
-	var timeOut = timeNow - self.PollTimeout;
-	var varCounter = self.varCounter;
-
-	function ClearVars() {
-		for (var id in self.xStat) {
-			self.xStat[id].polled = 0;
-			self.xStat[id].valid = false;
-		}
-	}
-
-	var id;
-
-	for (id in self.xStat) {
-		if (!self.xStat[id].valid) {
-			stillNeed = true;
-			if (self.xStat[id].polled < timeOut) {
-				self.sendOSC(id);
-				// self.debug("sending " + id);
-				self.xStat[id].polled = timeNow;
-				counter++;
-				if (counter > self.PollCount) {
-					break;
-				}
-			}
-		}
-	}
-
-	if (self.analyzing) {
-		if (varCounter < 200) {
-			self.varCounter = varCounter;
-		} else {
-			stillNeed = false;
-		}
-	}
-
-	if (!stillNeed) {
-		if (self.analyzing) {
-			//pause counting while resetting data
-			self.needStats = false;
-			var d = (timeNow - self.timeStart) / 1000;
-			self.log('info', 'Pass complete (' + varCounter + '@' + (varCounter / d).toFixed(1) + ')');
-			if (self.passTimeout < self.detVars.endTimeout) {
-				self.passTimeout += 200;
-				self.PollTimeout = self.passTimeout;
-				self.varCounter = 0;
-				self.timeStart = Date.now();
-				stillNeed = true;
-			} else if (self.passCount < self.detVars.endCount) {
-				self.passTimeout = self.detVars.startTimeout;
-				self.PollTimeout = self.passTimeout;
-				self.passCount += 1;
-				self.varCounter = 0;
-				self.PollCount = self.passCount;
-				self.timeStart = Date.now();
-				stillNeed = true;
-			} else {
-				self.analyzing = false;
-			}
-			if (self.analyzing) {
-				ClearVars();
-				self.log('info', `Sync Started (${self.PollCount}/${self.PollTimeout})`);
-			}
-		} else {
-			self.status(self.STATUS_OK,"Mixer Status loaded");
-			var c = Object.keys(self.xStat).length;
-			var d = (timeNow - self.timeStart) / 1000;
-			self.log('info', 'Sync complete (' + c + '@' + (c / d).toFixed(1) + ')');
-		}
-	}
-	self.needStats = stillNeed;
-};
-
-instance.prototype.firstPoll = function () {
-	var self = this;
-	var id;
-
-	self.timeStart = Date.now();
-	self.sendOSC('/?',[]);
-	self.pollStats();
-	self.pulse();
-};
-
-instance.prototype.stepsToFader = function (i, steps) {
-	var res = i / ( steps - 1 );
-
-	return Math.floor(res * 10000) / 10000;
-}
-
-instance.prototype.faderToDB = function ( f, asString ) {
-// “f” represents OSC float data. f: [0.0, 1.0]
-// “d” represents the dB float data. d:[-oo, +10]
-
-	// float Lin2db(float lin) {
-	// 	if (lin <= 0.0) return -144.0;
-	// 	if (lin < 0.062561095) return (lin - 0.1875) * 30. / 0.0625;
-	// 	if (lin < 0.250244379) return (lin - 0.4375) / 0.00625;
-	// 	if (lin < 0.500488759) return (lin - 0.6250) / 0.0125;
-	// 	if (lin < 1.0) return (lin - 0.750) / 0.025;
-	// 	return 10.;
-
-	var self = this;
-	var d = 0;
-	var steps = self.FADER_STEPS;
-
-	if (f <= 0.0) {
-		d = -144;
-	} else if (f < 0.062561095) {
-		d = (f - 0.1875) * 30.0 / 0.0625;
-	} else if (f < 0.250244379) {
-		d = (f - 0.4375) / 0.00625;
-	} else if (f < 0.500488759) {
-		d = (f - 0.6250) / 0.0125;
-	} else if (f < 1.0) {
-		d = (f - 0.750) / 0.025;
-	} else {
-		d = 10.0;
-	}
-
-	d = (Math.round(d * (steps - 0.5)) / steps)
-
-	if (asString) {
-		return (f==0 ? "-oo" : (d>=0 ? '+':'') + d.toFixed(1));
-	} else {
-		return d;
-	}
-};
-
-instance.prototype.dbToFloat = function ( d ) {
-	// “d” represents the dB float data. d:[-144, +10]
-	// “f” represents OSC float data. f: [0.0, 1.0]
-	var f = 0;
-
-	if (d <= -90) {
-		f = 0;
-	} else if (d < -60.) {
-		f = (d + 90.) / 480.;
-	} else if (d < -30.) {
-		f = (d + 70.) / 160.;
-	} else if (d < -10.) {
-		f = (d + 50.) / 80.;
-	} else if (d <= 10.) {
-		f = (d + 30.) / 40.;
-	}
-
-	return f;
-
-};
-
-instance.prototype.init_osc = function() {
-	var self = this;
-	var host = self.config.host;
-
-	if (self.oscPort) {
-		self.oscPort.close();
-	}
-	if (self.config.host === undefined) {
-		self.status(self.STATUS_ERROR,'No host IP');
-		self.log('error','No host IP');
-	} else {
-		self.oscPort = new OSC.UDPPort ({
-			localAddress: "0.0.0.0",
-			localPort: 2223 + self.port_offset,
-			remoteAddress: self.config.host,
-			remotePort: 2223,
-			metadata: true
-		});
-
-		// listen for incoming messages
-		self.oscPort.on('message', function(message, timeTag, info) {
-			var args = message.args;
-			var node = message.address;
-			var leaf = node.split('/').pop();
-			var v = 0;
-
-			if (!self.needStats) {
-				debug("received ", message, "from", info);
-			}
-			if (self.xStat[node] !== undefined) {
-				if (args.length>1) {
-					v = args[1].value;
-				} else {
-					v = args[0].value;
-				}
-				switch (leaf) {
-				case 'on':
-					self.xStat[node].isOn = (v == 1);
-					self.checkFeedbacks(self.xStat[node].fbID);
-					break;
-				case 'mute':
-				case 'led':
-				case '$solo':
-					self.xStat[node].isOn = (v == 1);
-					if ('led' == leaf) {
-						self.checkFeedbacks('col');
-					}
-					if ('$solo' == leaf) {
-						var gs = true;
-						if (v == 1){
-							self.soloList.add(node);
-						} else {
-							self.soloList.delete(node);
-							gs = (self.soloList.size > 0);
-						}
-						self.xStat['/$stat/solo'].isOn = gs;
-					}
-					self.checkFeedbacks(self.xStat[node].fbID);
-					break;
-				case 'fdr':
-				case 'lvl':
-					v = Math.floor(v * 10000) / 10000;
-					self.xStat[node][leaf] = v;
-					self.setVariable(self.xStat[node].dvID + '_p',Math.round(v * 100));
-					self.setVariable(self.xStat[node].dvID + '_d',self.faderToDB(v,true));
-					self.xStat[node].idx = self.fLevels[self.FADER_STEPS].findIndex((i) => i >= v);
-					break;
-				case 'name':
-					// no name, use behringer default
-					if (v=='') {
-						v = self.xStat[node].defaultName;
-					}
-					if (node.match(/\/main/)) {
-						v = v;
-					}
-					self.xStat[node].name = v;
-					self.setVariable(self.xStat[node].dvID, v);
-					break;
-				case 'col':
-					self.xStat[node].color = parseInt(args[0].value)
-					self.checkFeedbacks(self.xStat[node].fbID);
-					self.checkFeedbacks('led');
-					break;
-				case '$mono':
-				case '$dim':
-					self.xStat[node].isOn = (v == 1);
-					self.checkFeedbacks(self.xStat[node].fbID);
-					break;
-				default:
-					if ( node.match(/\$solo/)
-					|| node.match(/^\/cfg\/talk\//)
-					|| node.match(/^\/\$stat\/solo/) ) {
-						self.xStat[node].isOn = (v == 1);
-						self.checkFeedbacks(self.xStat[node].fbID);
-					}
-				}
-				self.xStat[node].valid = true;
-				self.varCounter += 1;
-				if (self.needStats) {
-					self.pollStats();
-				} else {
-					// debug(message);
-				}
-			} else if (leaf == '*') {
-				// /?~~,s~~WING,192.168.1.71,PGM,ngc‐full,NO_SERIAL,1.07.2‐40‐g1b1b292b:develop~~~~
-				var mixer_info = args[0].value.split(',');
-				self.myMixer.ip = mixer_info[1]
-				self.myMixer.name = mixer_info[2];
-				self.myMixer.model = mixer_info[3];
-				self.myMixer.serial = mixer_info[4];
-				self.myMixer.fw = mixer_info[5];
-				if ('WING_EMU' == mixer_info[4]) {
-					self.PollTimeout = 3200;
-					self.PollCount = 7;
-				}
-				self.setVariable('m_ip',	self.myMixer.ip);
-				self.setVariable('m_name',	self.myMixer.name);
-				self.setVariable('m_model', self.myMixer.model);
-				self.setVariable('m_serial', self.myMixer.serial);
-				self.setVariable('m_fw', self.myMixer.fw);
-			}
-			// else {
-			// 	debug(message.address, args);
-			// }
-		});
-
-		self.oscPort.on('ready', function() {
-			self.status(self.STATUS_WARNING,"Loading status");
-			self.log('info', `Sync Started (${self.PollCount}/${self.PollTimeout})`);
-			self.firstPoll();
-			self.heartbeat = setInterval( function () { self.pulse(); }, 9000);
-			self.blinker = setInterval( function() { self.blink(); }, 1000);
-			self.fader = setInterval( function() { self.doFades(); }, 1000 / self.fadeResolution);
-		});
-
-		self.oscPort.on('close', function() {
-			if (self.heartbeat) {
-				clearInterval(self.heartbeat);
-				delete self.heartbeat;
-			}
-			if (self.blinker) {
-				clearInterval(self.blinker);
-				delete self.blinker;
-			}
-			if (self.fader) {
-				clearInterval(self.fader);
-				delete self.fader;
-			}
-		});
-
-		self.oscPort.on('error', function(err) {
-			self.log('error', "Error: " + err.message);
-			self.status(self.STATUS_ERROR, err.message);
-			if (self.heartbeat) {
-				clearInterval(self.heartbeat);
-				delete self.heartbeat;
-			}
-			if (self.blinker) {
-				clearInterval(self.blinker);
-				delete self.blinker;
-			}
-			if (self.fader) {
-				clearInterval(self.fader);
-				delete self.fader;
-			}
-		});
-
-		self.oscPort.open();
-	}
-};
-
-// define instance variables
-instance.prototype.init_variables = function() {
-	var self = this;
-
-	var variables = [
-		{
-			label: 'WING IP Address',
-			name:  'm_ip',
-		},
-		{
-			label: 'WING Name',
-			name:  'm_name'
-		},
-		{
-			label: 'WING Model',
-			name:  'm_model'
-		},
-		{
-			label: 'WING Serial Number',
-			name:  'm_serial'
-		},
-		{
-			label: 'WING Firmware',
-			name:  'm_fw'
-		// },
-		// {
-		// 	label: 'Current Snapshot Name',
-		// 	name:  's_name'
-		// },
-		// {
-		// 	label: 'Current Snapshot Index',
-		// 	name:  's_index'
-		}
-	];
-	variables.push.apply(variables, self.variableDefs);
-
-	for (var i in variables) {
-		self.setVariable(variables[i].name);
-	}
-	self.setVariableDefinitions(variables);
-};
-
 // define instance feedbacks
 instance.prototype.init_feedbacks = function() {
 	var self = this;
@@ -1560,69 +1561,6 @@ instance.prototype.init_feedbacks = function() {
 	Object.assign(feedbacks,this.toggleFeedbacks);
 	Object.assign(feedbacks,this.colorFeedbacks);
 	this.setFeedbackDefinitions(feedbacks);
-};
-
-// Return config fields for web config
-instance.prototype.config_fields = function () {
-	return [
-		{
-			type: 'textinput',
-			id: 'host',
-			label: 'Target IP',
-			tooltip: 'The IP of the WING console',
-			width: 6,
-			regex: this.REGEX_IP
-		}
-		// ,
-		// {
-		// 	type: 	'checkbox',
-		// 	label: 	'Analyze',
-		// 	id:		'analyze',
-		// 	tooltip: 'Cycle through console sync timing variables\nThis will temporarily disable the module',
-		// 	default: 0
-		// }
-	];
-};
-
-// When module gets deleted
-instance.prototype.destroy = function() {
-	if (this.heartbeat) {
-		clearInterval(this.heartbeat);
-		delete this.heartbeat;
-	}
-	if (this.blinker) {
-		clearInterval(this.blinker);
-		delete this.blinker;
-	}
-	if (this.fader) {
-		clearInterval(this.fader);
-		delete this.fader;
-	}
-	if (this.oscPort) {
-		this.oscPort.close();
-	}
-	debug("destroy", this.id);
-};
-
-instance.prototype.sendOSC = function (node, arg) {
-	var self = this;
-
-	if (self.oscPort) {
-		self.oscPort.send({
-			address: node,
-			args: arg
-		});
-		// self.debug('sending ',node, (arg? arg:''));
-	}
-};
-
-instance.prototype.sendUDP = function (data) {
-	var self = this;
-	var bytes = Buffer.from(data, 'hex');
-
-	if (self.udpPort) {
-		self.udpPort.send(data);
-	}
 };
 
 instance.prototype.build_choices = function() {
@@ -1913,9 +1851,9 @@ instance.prototype.action = function(action) {
 			}
 		break;
 
-		/* don't have details for this, yet
-		 * It's probably in mon/1..2/level
-		 */
+		// don't have details for this, yet
+		 // It's probably in mon/1..2/level
+		 
 		// case 'solo_level':
 		// case 'solo_level_a':
 		// 	cmd = '/config/solo/level';
@@ -2033,6 +1971,4 @@ instance.prototype.action = function(action) {
 		}
 	}
 };
-
-instance_skel.extendedBy(instance);
-exports = module.exports = instance;
+*/

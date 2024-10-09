@@ -6,12 +6,12 @@
 	"send_bmm": {
 		"main": 4,
 		"mtx": 8,
-		"bus": 8
+		"bus": 16
 	},
 	"send_m": {
 		"mtx": 8
 	},
 	"direct": {
-		"dir": 2
+		"dir": 1
 	}
 }
